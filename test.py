@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader
+
+try:
+    import torch
+    from torch.utils.data import DataLoader
+except ModuleNotFoundError:
+    torch = None
+    DataLoader = None
 
 from feature_engineering import (
     INDEX_TO_LABEL,
@@ -14,9 +20,16 @@ from feature_engineering import (
     build_tabular_features,
     fixed_background_predictions,
 )
-from load_data import EEGDataset
-from model import Net
+try:
+    from load_data import EEGDataset
+    from model import Net
+except ModuleNotFoundError:
+    EEGDataset = None
+    Net = None
+
 from utils import get_device
+
+warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,6 +47,7 @@ CONFIG = {
     "num_workers": 0,
     "use_cpu": False,
     "prediction_rule": "threshold",
+    "decision_threshold": 0.445,
     "use_neural_fallback": False,
 }
 
@@ -50,13 +64,16 @@ def predict_with_tabular_model(test_df: pd.DataFrame) -> np.ndarray:
     return (
         target_prob,
         int(bundle.get("prediction_background_count", bundle.get("background_per_subject_session", 90))),
-        float(bundle.get("decision_threshold", 0.50)),
+        float(bundle.get("decision_threshold", CONFIG["decision_threshold"])),
         selected_model,
         bundle.get("prediction_rule", CONFIG["prediction_rule"]),
     )
 
 
 def predict_with_neural_model(test_df: pd.DataFrame) -> np.ndarray:
+    if torch is None or DataLoader is None or EEGDataset is None or Net is None:
+        raise RuntimeError("PyTorch is required for neural fallback inference.")
+
     device = get_device(CONFIG["use_cpu"])
     test_dataset = EEGDataset(data_dir=CONFIG["test_dir"], label_csv=None, normalize=False)
     test_loader = DataLoader(
@@ -94,7 +111,7 @@ def main() -> None:
         target_prob, background_count, threshold, model_name, prediction_rule = predict_with_tabular_model(test_df)
     elif CONFIG["use_neural_fallback"]:
         target_prob, background_count = predict_with_neural_model(test_df)
-        threshold = 0.50
+        threshold = CONFIG["decision_threshold"]
         model_name = "neural_fallback"
         prediction_rule = CONFIG["prediction_rule"]
     else:

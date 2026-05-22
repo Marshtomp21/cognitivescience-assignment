@@ -115,7 +115,11 @@ def build_signal_features(epochs: np.ndarray) -> np.ndarray:
 def build_tabular_features(df: pd.DataFrame, data_dir: str | Path) -> np.ndarray:
     df = add_metadata(df) if "sub" not in df.columns else df
     epochs = load_raw_epochs(data_dir, df["eeg_file"])
-    return np.concatenate([build_metadata_features(df), build_signal_features(epochs)], axis=1)
+    metadata_features = build_metadata_features(df)
+    # Session id 3 is unseen during training. Keep within-session derived features
+    # such as rank/gaps, but neutralize the raw session id to avoid extrapolation.
+    metadata_features[:, 1] = 0.0
+    return np.concatenate([metadata_features, build_signal_features(epochs)], axis=1)
 
 
 def fixed_background_predictions(

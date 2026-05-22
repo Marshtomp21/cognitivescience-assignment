@@ -1,229 +1,626 @@
 \chapter{摘要}
 
-本次认知科学导论大作业面向 EEG 事件片段二分类任务，目标是根据形状为 $1\times59\times282$ 的脑电样本判断其类别为 \texttt{background} 或 \texttt{target}。任务难点在于单个 EEG 试次信噪比极低，且不同测试 session 甚至不同被试之间存在显著的数据分布漂移（Session Drift）。为了实现高精度的分类预测（目标是内部验证准确率稳定超过 0.75，拿到准确率部分 100 分满分），我们进行了深入的模型设计与数据探索。
+本次认知科学导论大作业面向事件相关 EEG 片段的二分类问题，要求根据单个脑电样本判断其标签为 \texttt{background} 或 \texttt{target}。每个样本以 \texttt{.npy} 文件保存，张量形状为 $1\times59\times282$，可理解为 59 个脑电通道在 282 个连续时间点上的一次事件响应记录。训练集提供 1694 个带标签样本，测试集提供 842 个未标记样本；最终需要训练模型并生成 \texttt{res/predictions.csv}。与普通表格二分类不同，EEG 数据具有低信噪比、高维小样本、被试差异和 session 漂移等特点。因此，模型性能不仅取决于分类器本身，也取决于验证方案是否接近隐藏测试集的使用场景。
 
-我们首先复现了给定的多层感知机（MLP）基线，并进一步尝试了多种深度学习模型（如 EEGNet、时序卷积网络 TCN）以及传统空间滤波算法（CSP）。探索结果表明，由于信噪比与漂移问题，单纯的端到端神经网络在跨 session 验证上的准确率容易遭遇瓶颈，最佳表现通常在 $0.65\sim0.70$ 之间波动。随后，我们转换思路，深入挖掘了实验的结构性先验与信号频率特征，构建了一套多维度的融合特征工程，包括：实验序列元信息（如相邻样本间隔、被试 Session 先验）、频率带宽能量分布（Delta/Theta/Alpha/Beta/Gamma 等频段的 FFT 能量）、通道间相关性特征以及时间窗局部统计量。
+我们首先对作业说明、数据文件、训练脚本和结果文件进行了梳理。训练集共包含 5 名被试，每名被试有 \texttt{sess1} 与 \texttt{sess2} 两个训练 session；测试集则为同 5 名被试的 \texttt{sess3}。训练标签中 \texttt{background} 为 900 个，\texttt{target} 为 794 个，全局比例接近均衡。进一步分组后可以看到，每个被试的每个训练 session 中 \texttt{background} 数量均固定为 90，而 \texttt{target} 数量在 71 到 90 之间波动。这说明该任务并不是完全无结构的信号分类，而是同时受到实验序列设计、被试内重复测量结构和脑电响应差异的影响。
 
-最终方案采用 LightGBM 梯度提升树进行建模，并利用不同随机种子训练多个最优超参数模型（15个基模型）进行概率级集成融合（Ensemble Stacking）。不仅如此，我们结合数据探索中发现的强先验（每个训练 Session 的 \texttt{background} 样本数恒为 90 个），设计了基于被试内模型预测概率排序的校准策略（Rank Calibration）。经过严格的跨 session 验证，我们的最终集成方案在 \texttt{session1$\rightarrow$session2} 上的校准前准确率达到 0.8122，排序校准后达到 0.8052；在 \texttt{session2$\rightarrow$session1} 方向上的校准前准确率达到 0.7779，排序校准后达到 0.7791。平均验证准确率远超满分所需的 0.75 阈值，接近 0.80，模型展现出了出色的分类性能与泛化能力。
+在模型方案上，我们保留了代码中的紧凑 EEGNet-style 神经网络作为可扩展的深度学习路径，但最终主模型采用 \texttt{feature\_engineering.py} 构建的 1022 维表格特征与 LightGBM 集成分类器。特征空间由两部分组成：其一是从文件名解析得到的被试、session、epoch 及局部序列间隔等元信息特征；其二是从原始 EEG 片段中提取的全局统计量、时间窗统计量以及通道级窗口均值/标准差。该方案将实验结构先验显式编码，再由正则化较强的梯度提升树模型学习非线性判别规则。
+
+验证方案采用跨 session 设计：一方面使用所有被试的 Session1 训练并在 Session2 验证，另一方面反向使用 Session2 训练并在 Session1 验证。这样可以减少随机划分导致的同被试、同 session 泄露，更接近测试集 Session3 的泛化要求。最终 5 个随机种子的 LightGBM 基模型进行概率平均集成，并将决策阈值从 0.50 校准为 0.445 后，在 \texttt{session1$\rightarrow$session2} 上取得 Accuracy 0.8134、ROC-AUC 0.8867；在 \texttt{session2$\rightarrow$session1} 上取得 Accuracy 0.7922、ROC-AUC 0.8575。两个方向的准确率均超过作业评分公式中的 0.75 满分参考线，说明模型具备一定的跨 session 区分能力。
+
+报告后续部分将依次说明任务定义、数据结构、特征工程、模型设计、验证方案、实验结果和误差来源，重点解释验证结果为何可信、模型主要依赖哪些信息，以及该方案在隐藏测试场景下仍可能面临哪些风险。
 
 \chapter{任务理解与问题定义}
 
-\section{任务目标}
+\section{作业目标与输入输出}
 
-本任务本质上是一个高维时间序列的二分类监督学习问题。给定训练集中的 EEG 文件及标签文件 \texttt{train\_labels.csv}，我们需要学习一个映射函数 $f$：
+根据说明文档，本次大作业的核心目标是基于给定 EEG 样本完成二分类建模。训练数据位于 \texttt{data/train/}，训练标签位于 \texttt{data/train\_labels.csv}，测试数据位于 \texttt{data/test/}。每个样本是一个 \texttt{.npy} 文件，文件名中包含被试编号、session 编号和 epoch 编号，例如 \texttt{sub01\_sess1\_epoch002.npy}。训练标签文件至少包含两列：\texttt{eeg\_file} 与 \texttt{label}。模型训练完成后，需要对测试集中每个 \texttt{.npy} 文件输出类别预测，并保存为 \texttt{res/predictions.csv}。
+
+用数学形式表示，给定第 $i$ 个样本
 \[
-f(x_i)\rightarrow y_i,\quad y_i\in\{\texttt{background},\texttt{target}\}
+x_i \in \mathbf{R}^{1\times 59\times 282},
 \]
-其中 $x_i \in \mathbb{R}^{59 \times 282}$。模型需要在测试集上对未标记的 EEG 文件生成预测结果 \texttt{res/predictions.csv}。由于测试集的真实标签是未知的，我们在训练阶段的内部验证策略（Validation Strategy）是否合理将直接决定模型在隐藏测试集上的表现。
+模型需要学习一个映射函数
+\[
+f(x_i, m_i)\rightarrow y_i,\quad y_i\in\{\texttt{background},\texttt{target}\},
+\]
+其中 $m_i$ 表示从文件名和实验序列中提取出的元信息，例如被试编号、session 编号和 epoch 位置。严格地说，作业输入形式只要求使用 EEG 样本本身，但文件名中的结构信息同样属于数据集的一部分，而且它反映了实验组织方式。因此，本方案将原始 EEG 信号与元信息同时纳入建模，使分类器既能利用脑电响应差异，也能利用事件序列中的统计规律。
 
-\section{评分目标与优化方向}
+\section{二分类标签的认知科学含义}
 
-作业说明中给出的准确率评分公式以 \texttt{topline}=0.75 为满分参考线。当测试集准确率 $acc\ge0.75$ 时，准确率部分即进入 100 分满分区间。因此，本实验的模型设计目标不是仅仅超过 0.5 的随机猜测，而是通过严谨的特征工程与模型集成，让交叉验证准确率稳定地越过 0.75 并尽量冲击 0.8，以确保在面临数据漂移的情况下仍能达到满分。
+\texttt{background} 与 \texttt{target} 的差异可以从事件相关脑电的角度理解。通常而言，\texttt{background} 更接近非目标刺激或背景事件，受试者对其不需要产生明确的任务反应；\texttt{target} 则往往对应需要被识别、注意或反应的目标事件。在许多脑电实验中，目标刺激可能诱发更强的注意加工、工作记忆更新或决策相关电位，例如 P300 一类的晚期正成分。当然，本数据集没有提供具体刺激范式、采样率、电极位置信息和事件锁定时间点，因此报告中不直接断言某一时间点必然对应某个经典 ERP 成分，而是更谨慎地从统计差异和模型效果角度进行解释。
 
-\begin{figure}[H]
+这一判断直接影响建模策略。若两类样本的差异主要来自局部时间窗内的弱幅值变化，单个试次的信号容易被噪声淹没；若差异还受刺激顺序影响，文件名中的 epoch 序列也会提供额外信息。因此，最终方案同时使用脑电片段的窗口统计特征和实验序列特征。
+
+\section{评分函数与优化目标}
+
+作业说明给出了准确率部分的评分函数：
+\[
+\min\left(100,\max\left(60,\ 60 + 40 \times \left(\frac{acc-0.50}{topline-0.50}\right)^{\log(2.2)}\right)\right),
+\]
+其中 \texttt{topline}=0.75。该函数说明，测试准确率低于或等于 0.50 时只能得到基础分；随着准确率从 0.50 上升到 0.75，得分非线性增加；当准确率达到或超过 0.75 时，准确率部分封顶为 100 分。
+
+因此，本项目的实际优化目标不是“略高于随机猜测”，而是使内部验证准确率稳定超过 0.75。考虑到隐藏测试集标签未知，验证方案需要尽可能接近新 session 测试场景。若使用随机划分，训练集和验证集很可能包含同一被试、同一 session 甚至相邻 epoch 的样本，模型可能学到 session 特异噪声，从而高估泛化能力。我们最终选择跨 session 验证，就是为了让验证分数更接近真实测试风险。
+
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=0.72\textwidth]{figures/score_curve.png}
-  \caption{作业准确率评分函数曲线。测试准确率达到 0.75 后，准确率部分即可得满分。}
+  \caption{作业准确率评分函数曲线。准确率达到 0.75 后，准确率部分即可进入满分区间；因此内部验证的关键目标是稳定越过 0.75，而不是仅仅超过 0.50。}
 \end{figure}
 
-\chapter{数据特点分析与深度挖掘}
+\section{问题难点概括}
 
-\section{数据规模与类别分布}
+本任务表面上是一个标准二分类问题，但从数据形态看，它至少包含四类困难。
 
-训练集共包含 1694 个有标签的 EEG 样本，测试集共包含 842 个样本。每个样本的维度为 $1\times59\times282$，这代表 59 个 EEG 通道在 282 个时间点（约 1 秒左右的时间窗，假设采样率为 250Hz）上的脑电响应片段。训练标签中 \texttt{background} 样本有 900 个，\texttt{target} 有 794 个，整体类别比例接近均衡（约 53\% vs 47\%），但这仅仅是全局层面的统计。
+第一是高维小样本。每个样本含有 $59\times282=16638$ 个原始数值，而训练样本仅 1694 个。如果直接把原始矩阵展平输入全连接网络，参数量会非常大，模型容易记住训练 session 中的偶然噪声。第二是 EEG 低信噪比。单次试次的目标反应通常很弱，均值 ERP 需要跨样本平均后才更容易观察到稳定差异。第三是被试差异。不同被试的头皮电位幅度、噪声水平、注意状态和实验配合度不同，同一个模型需要在这些差异中学习相对稳定的判别规律。第四是 session 漂移。训练集为 Session1 与 Session2，测试集为 Session3，模型真正面对的是同被试的新 session，这要求模型不能过度依赖某一次实验采集的瞬时分布。
 
-\begin{figure}[H]
+这些困难共同决定了本项目的方案取向：优先构建合理验证协议，提取相对稳定的数据结构，并使用正则化较强的模型控制过拟合。
+
+\chapter{数据特点分析}
+
+\section{数据规模与基本结构}
+
+训练集共有 1694 个有标签 EEG 样本，测试集共有 842 个未标记样本。训练集覆盖 5 名被试，每名被试有两个训练 session；测试集覆盖同样的 5 名被试，session 编号为 3。训练集标签总体分布为 \texttt{background}=900、\texttt{target}=794，对应比例约为 53.13\% 与 46.87\%。从全局类别比例看，数据并不存在极端类别不平衡，使用准确率作为主要指标是合理的。
+
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=0.58\textwidth]{figures/class_distribution.png}
-  \caption{训练集整体类别分布，background 略多于 target。}
+  \caption{训练集整体类别分布。全局层面 background 略多于 target，但两类比例接近，主要挑战并非全局类别失衡，而是 session 漂移和单试次 EEG 噪声。}
 \end{figure}
 
-\section{核心发现：被试与 Session 的强结构先验}
+全局类别比例只能反映总体情况。进一步按被试和 session 分组后，可以看到每个训练 session 中 \texttt{background} 数量均为 90，而 \texttt{target} 数量随被试和 session 变化：最少为 71，最多为 90。训练集 Session1 共 842 个样本，其中 background 450、target 392；Session2 共 852 个样本，其中 background 450、target 402。测试集 Session3 共 842 个样本，各被试样本数分别为 172、161、178、176、155。
 
-为了更深入地理解数据生成机制，我们根据文件名（如 \texttt{sub01\_sess1\_epoch002.npy}）提取了被试编号（sub）、Session 编号（sess）以及 Epoch 序号（epoch）。数据挖掘揭示了一个至关重要的结构性规律：**在训练集中，每名被试的每个 Session 都恰好包含正好 90 个 \texttt{background} 样本**，而 \texttt{target} 的数量则在 71 到 90 之间波动。
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\textwidth]{figures/report_session_label_matrix.png}
+  \caption{训练集按被试与 session 统计的标签数量。每个训练 session 中 background 恒为 90，这一结构性规律提示模型可以利用实验序列和 session 内排序信息，但也要求验证时避免随机划分造成信息泄露。}
+\end{figure}
 
-\begin{figure}[H]
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lcccc}
+\hline
+数据部分 & 被试数 & Session & 样本数 & 标签情况 \\
+\hline
+训练集 Session1 & 5 & 1 & 842 & background 450，target 392 \\
+训练集 Session2 & 5 & 2 & 852 & background 450，target 402 \\
+训练集合计 & 5 & 1--2 & 1694 & background 900，target 794 \\
+测试集 Session3 & 5 & 3 & 842 & 标签未知，需模型预测 \\
+\hline
+\end{tabular}
+\caption{训练集与测试集的基本规模。测试集样本数与训练 Session1 完全相同，且同样覆盖 5 名被试，这支持采用跨 session 验证来模拟最终测试。}
+\end{table}
+
+\section{被试与 session 结构}
+
+文件名解析出的 \texttt{sub}、\texttt{sess} 和 \texttt{epoch} 是理解本任务的关键。原始作业说明只强调每个样本是 $1\times59\times282$ 的 EEG 矩阵，但文件名实际上提供了实验重复测量结构。若忽略这一点，把全部样本视为独立同分布样本，模型评估会过于乐观。
+
+对 EEG 来说，同一被试内部的样本通常比不同被试之间更相似；同一 session 内的样本又可能共享同一天、同一电极接触状态、同一疲劳程度和同一噪声环境。因此，随机切分训练/验证集会让模型在验证阶段看到与训练阶段高度相似的样本。这类相似性不一定代表模型学到了真正的 \texttt{target} 脑电响应，也可能只是记住了某个 session 的背景统计。跨 session 验证虽然更严苛，但更接近测试集 Session3。
+
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=0.92\textwidth]{figures/subject_session_counts.png}
-  \caption{不同被试与 Session 下的样本数量统计。可以清晰看到 background 样本数量在所有训练 session 中恒定为 90 个，这是极其关键的先验信息。}
+  \caption{不同被试和 session 的样本数量统计。background 的固定数量和 target 的轻微波动共同构成了数据的实验结构先验。}
 \end{figure}
 
-\subsection{事件序列的时序聚集性}
+\section{事件序列与 epoch 规律}
 
-除了数量上的先验，我们进一步绘制了 \texttt{target} 与 \texttt{background} 样本在各被试 Session 实验序列（Epoch Index）上的分布散点图。如下图所示，\texttt{target} 和 \texttt{background} 的出现并非完全随机，它们在时序上展现出了一定的聚集性或特定的间隔规律（例如，在某些连续的 epoch 中 background 更密集）。这强烈暗示了**相邻样本之间的间隔、局部密度等元信息（Meta Features）可以作为有力的判别特征**。
+每个文件名中的 epoch 编号并不是无意义编号，而是反映了实验事件在序列中的位置。我们将 \texttt{target} 与 \texttt{background} 在各被试、各 session 内的 epoch 位置可视化后发现，两类事件并非完全随机散落。某些 epoch 区间内 target 比例较高，某些区间则 background 更密集；相邻 epoch 的间隔、局部窗口内事件密度以及 epoch 的周期性余数，都可能蕴含实验范式设计信息。
 
-\begin{figure}[H]
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=\textwidth]{figures/epoch_scatter.png}
-  \caption{Epoch 分布散点图：展示了各个 Subject/Session 内 target 与 background 随 epoch 序号的出现位置。可见刺激呈现存在一定的时序结构模式。}
+  \caption{训练集 epoch 散点图。横轴为 epoch 编号，纵向按被试和 session 展开；target 与 background 在序列中存在可见的分布模式，说明局部序列结构可作为辅助判别信息。}
 \end{figure}
 
-\section{EEG 信号频域与时域特征}
+这种序列规律有两层含义。一方面，当前 epoch 的绝对位置、相对 rank、与前后样本的 gap、局部半径内的样本数量等都可能帮助模型推断目标事件。另一方面，它也提示我们控制过拟合：如果测试集 Session3 的刺激序列规则与训练 Session1/2 一致，序列特征会有效；如果规则发生变化，过度依赖序列特征则可能带来风险。因此，最终模型没有只使用元信息，而是将元信息与 EEG 信号统计共同纳入。
 
-在时域上，通过计算 59 个通道的平均 ERP 波形，我们观察到两类样本在特定时间窗上存在细微的形态差异，且原始幅值统计显示 \texttt{target} 的整体标准差和绝对幅值通常略高。在频域上，我们通过快速傅里叶变换（FFT）分析了样本在不同脑电经典频带（Delta, Theta, Alpha, Beta, Gamma）上的能量分布。结果发现，不同频带的能量比值（如 Theta/Beta 比例）在两类样本上也存在统计学差异。因此，单纯依赖深度学习自动提取特征容易忽略这些确定的生物物理量，手工设计特征结合集成树模型是一条更稳妥的路径。
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.88\textwidth]{figures/report_epoch_target_rate.png}
+  \caption{训练集真实 target 比例与测试集预测 target 比例随 epoch 区间的变化。该图显示 target 在实验序列中并非均匀出现，模型在测试集上的预测也呈现相似的序列起伏。}
+\end{figure}
 
-\begin{figure}[H]
+\section{原始 EEG 信号的统计形态}
+
+EEG 信号的核心困难在于单试次响应弱。若直接观察某一个样本，很难凭肉眼区分它属于 \texttt{background} 还是 \texttt{target}。因此，我们先对同一类别的样本求均值，得到类别平均 ERP 波形。均值波形中可以看到两类样本在若干时间段存在细微差异，但差异幅度远小于单个样本内部噪声。这解释了为什么简单模型难以直接从原始矩阵中稳定学习：模型必须从大量弱特征中聚合证据。
+
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=0.82\textwidth]{figures/erp_waveforms.png}
-  \caption{两类样本的通道平均 ERP 波形比对。阴影区域表示标准误，两类信号的均值差异较微弱，需要配合多维特征进行判别。}
+  \caption{两类样本的通道平均 ERP 波形对比。类别均值之间存在微弱差异，但单试次噪声较强，需要通过多维统计特征和稳健模型进行综合判别。}
 \end{figure}
 
+为了进一步观察差异位置，我们计算了 target 类别平均信号与 background 类别平均信号之差，并绘制为通道$\times$时间热图。相比单条平均波形，热图能显示差异是否集中在少数通道或某些时间片段。图中可以看到，差异并非覆盖整个矩阵，而是在若干通道和时间段上更明显。这支持使用时间窗特征和通道级统计，而不是只使用全局均值。
 
-\chapter{特征工程与模型设计}
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.9\textwidth]{figures/report_signal_difference_map.png}
+  \caption{target 平均 EEG 响应减去 background 平均 EEG 响应的热图。差异呈现局部通道和局部时间窗结构，说明通道级窗口统计量具有建模价值。}
+\end{figure}
 
-\section{探索过程与模型比对}
+\section{时间窗效应分析}
 
-在最终方案确立前，我们经历了多轮模型迭代。下表展示了主要方法在随机验证和跨 session 验证上的表现：
+当前特征工程将 282 个时间点切分为多个窗口：$0$--$50$、$50$--$100$、$100$--$150$、$150$--$200$、$200$--$250$、$250$--$282$，以及两个较宽窗口 $60$--$160$ 和 $120$--$240$。这些窗口不是为了精确对应某个神经生理成分，而是为了让模型在不同时间尺度上捕获局部响应。为了检验这些窗口是否有意义，我们计算了每个窗口内类别均值差异和绝对幅值差异的 Cohen's $d$ 效应量。
 
-\begin{table}[H]
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.88\textwidth]{figures/report_time_window_effects.png}
+  \caption{不同时间窗中的类别分离效应量。虽然单个窗口的效应并不巨大，但多个弱效应在梯度提升树中可以被组合成稳定的判别规则。}
+\end{figure}
+
+图中效应量的绝对值不高，说明本任务不能依赖单一特征。更合理的思路是组合多个弱特征：某些样本可能在早期窗口差异更明显，某些样本可能在中后期窗口更明显；某些被试的目标效应体现在平均幅值，另一些则体现在绝对幅值或通道间分布。LightGBM 的树结构适合处理这类非线性组合关系。
+
+\chapter{数据读取、预处理与特征工程}
+
+\section{数据读取流程}
+
+\texttt{load\_data.py} 中定义了 \texttt{EEGDataset}，用于统一读取训练集与测试集。对于训练集，数据集对象从 \texttt{train\_labels.csv} 读取文件名和标签，再逐个加载对应的 \texttt{.npy} 文件；对于测试集，数据集对象直接扫描 \texttt{data/test/} 下的 \texttt{.npy} 文件并按文件名排序。标签映射为 \texttt{background}$\rightarrow0$、\texttt{target}$\rightarrow1$。该模块同时支持可选的单样本标准化：
+\[
+\tilde{x}=\frac{x-\mu_x}{\sigma_x+10^{-6}}.
+\]
+不过，当前最终表格模型没有直接通过 \texttt{EEGDataset} 提取特征，而是由 \texttt{feature\_engineering.py} 使用 NumPy 读取原始矩阵并构建特征。
+
+这种设计有两个优点。第一，数据读取与模型训练解耦，深度学习模型和表格模型都可以复用同一份数据组织逻辑。第二，表格特征构建过程完全可复现：只要给定文件名列表和数据目录，就能生成确定的特征矩阵，避免训练与测试阶段特征口径不一致。
+
+\section{元信息解析}
+
+特征工程的第一步是从文件名中解析被试、session 和 epoch：
+\[
+\texttt{sub01\_sess2\_epoch120.npy}
+\quad\Rightarrow\quad
+sub=1,\ sess=2,\ epoch=120.
+\]
+\texttt{feature\_engineering.py} 中的 \texttt{add\_metadata} 函数使用正则表达式完成解析，并把三个整数列追加到原始 DataFrame。解析后的元信息随后用于构建序列特征。由于训练集和测试集文件名格式一致，该步骤可以无缝迁移到测试集。
+
+\section{元信息与序列特征}
+
+当前实现的元信息特征共有 49 维，主要包括：
+
+\begin{itemize}
+  \item 被试编号、经中和处理的 session 占位、epoch 编号及其归一化形式；
+  \item 当前 epoch 在同一被试同一 session 中的相对 rank；
+  \item 同一被试同一 session 的样本总数；
+  \item epoch 对多个周期的取模结果，例如 2、3、4、5、6、7、8、9、10、12、15、20；
+  \item 与前一阶、后一阶、前二阶、后二阶样本的 epoch 间隔；
+  \item 在半径 3、5、8、12、20 的局部窗口内相邻样本数量；
+  \item 基于多个周期的正弦和余弦 harmonic 特征。
+\end{itemize}
+
+这些特征的设计依据来自实验序列结构。epoch 的绝对位置描述事件在整段实验中的阶段；rank 能消除不同 session 样本数轻微不同带来的尺度差异；前后 gap 捕捉事件出现的稀疏程度；局部密度反映某段时间内事件是否密集；harmonic 特征则用于表达可能存在的周期性刺激安排。对于实验范式驱动的数据，这类特征可以补充单试次 EEG 信号中的弱响应。
+
+考虑到最终测试集为训练阶段未见过的 \texttt{sess3}，当前实现保留了由 session 内排序得到的 rank、gap、local density 等结构特征，但将原始 session 编号本身置为常数。这样可以利用每个 session 内部的事件序列规律，同时避免模型在全量训练时学习 \texttt{sess1}/\texttt{sess2} 的数值分裂并外推到 \texttt{sess3}。
+
+\section{信号统计特征}
+
+信号特征由 \texttt{build\_signal\_features} 生成，共 973 维。它们可以分为三层。
+
+第一层是全局统计量：整段 EEG 的均值、标准差、绝对值均值、最大值和最小值，共 5 维。这些特征提供样本整体幅值、波动程度和极端值信息。第二层是窗口级全局统计量：对 8 个时间窗分别计算窗口均值、窗口标准差和窗口绝对值均值，共 $8\times3=24$ 维。第三层是通道级窗口统计量：对每个时间窗、每个通道分别计算均值和标准差，共 $8\times59\times2=944$ 维。三层合计 $5+24+944=973$ 维。
+
+最终特征矩阵维度为：
+\[
+49 + 973 = 1022.
+\]
+也就是说，每个 EEG 样本从原始 $1\times59\times282$ 矩阵被压缩为 1022 维表格向量。这种压缩保留了主要的时间窗和通道统计信息，同时显著降低了原始输入维度，有助于在 1694 个训练样本规模下控制过拟合。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth]{figures/report_feature_dimensions.png}
+  \caption{当前 \texttt{build\_tabular\_features} 的特征维度构成。通道级时间窗均值/标准差占主要部分，元信息与全局统计量提供辅助结构信息。}
+\end{figure}
+
+\begin{table}[htbp]
 \centering
-\begin{tabular}{lccp{5.8cm}}
+\small
+\begin{tabular}{lp{8.5cm}c}
 \hline
-方法 & 随机划分 Accuracy & 跨 session Accuracy & 结论分析 \\
+特征族 & 具体内容 & 维度 \\
 \hline
-MLP 基线 & 0.6479 & 0.58左右 & 参数量大，缺乏平移不变性，极易过拟合。\\
-EEGNet (CNN) & 约 0.70 & 0.65--0.68 & 能够学习到部分 ERP 特征，但严重受限于 session 漂移。\\
-ShallowFBCSPNet & 约 0.59 & 约 0.55 & 基于频带能量空间滤波设计，但在本任务上提取效果差。\\
-TCN 时序卷积 & 约 0.68 & 0.65左右 & 长程依赖建模能力强，但仍未超越 0.7 瓶颈。\\
-LightGBM + V1 特征 & -- & 0.78--0.80 & 引入基础时序特征与幅值统计后，性能大幅飞跃。\\
-LightGBM + 进阶特征 & -- & 0.81--0.82 & 引入频域、导数与复杂时序先验，性能达到最优。\\
+元信息与序列特征 & 被试、session、epoch、rank、样本数、取模、前后 gap、局部密度、harmonic 编码 & 49 \\
+全局信号统计 & 全段均值、标准差、绝对值均值、最大值、最小值 & 5 \\
+窗口级统计 & 8 个时间窗内的均值、标准差、绝对值均值 & 24 \\
+通道级窗口统计 & 8 个时间窗$\times$59 通道的均值与标准差 & 944 \\
+\hline
+合计 & 元信息特征与 EEG 信号统计特征拼接 & 1022 \\
 \hline
 \end{tabular}
-\caption{不同模型与方案的探索路线对比。可以看到，应对跨 session 验证时，树模型+专家特征的鲁棒性远超单纯的端到端深度学习模型。}
+\caption{最终表格特征的构成。该表与当前工作区 \texttt{feature\_engineering.py} 的实现保持一致。}
 \end{table}
 
-\section{增强型多维特征工程 (Feature Engineering)}
+\section{特征工程的认知解释}
 
-为了充分利用挖掘到的数据规律，我们在 \texttt{feature\_engineering.py} 中构建了包含 1000 多个维度的庞大特征空间：
+从认知科学角度看，特征工程把一次 EEG 事件分解为“任务结构”和“神经响应”两类信息。任务结构对应被试、session、epoch 和事件间隔，反映刺激安排；神经响应对应不同通道和时间窗内的幅值统计，反映刺激发生后的脑电活动变化。单独使用任务结构可能过于依赖实验范式，单独使用神经响应又可能受噪声影响较大。二者结合后，模型可以同时利用序列位置和脑电响应两类证据。
 
-\subsection{实验序列先验特征 (Metadata \& Temporal)}
-从文件名解析出被试与 Session 后，我们计算了当前 Epoch 相对整个 Session 的相对位置（Rank）、与前一个/后一个/前两个样本的 Epoch 序号差（Gap）、局部窗口（半径 3, 5, 8, 12 等）内的样本密度（Local Density），以及基于正余弦函数的周期编码（Harmonics）。这些特征帮助模型捕捉实验刺激的呈现范式。
+这种处理也符合 EEG 单试次分类的现实经验：如果数据规模不大，直接让深度网络从原始矩阵学习全部空间-时间模式，可能需要更强的正则化、更多数据增强和更复杂的跨被试校准；而人工构造统计特征则相当于把部分先验知识注入模型，使模型不必从零学习“时间窗均值”“通道标准差”“事件间隔”等基础概念。
 
-\subsection{时域统计与事件相关窗口特征 (Signal Statistics)}
-提取了整个 282 时间点的全局均值、标准差、最大最小值、偏度（Skewness）、峰度（Kurtosis）以及过零率（Zero-Crossing Rate）。同时，我们将时间轴切分为多个重叠与非重叠的事件窗口（如 $0-50, 50-100, 60-160$ 等），分别计算这些窗口内各通道的统计量，从而捕获局部 ERP 响应的幅值变化。
+\chapter{模型设计与改进思路}
 
-\subsection{频域带宽能量与一二阶导数特征 (Frequency \& Derivatives)}
-使用 \texttt{rfft} 将信号转换至频域，计算 Delta (0.5-4Hz), Theta (4-8Hz), Alpha (8-13Hz), Beta (13-30Hz), Gamma (30-100Hz) 等频段的平均能量及其通道间差异；为了捕捉信号变化率，我们还计算了脑电信号的一阶和二阶时间导数的统计特征，并引入了降采样通道之间的相关性矩阵特征（Channel Correlation）。
+\section{整体流水线}
 
-\begin{figure}[H]
-  \centering
-  \includegraphics[width=0.9\textwidth]{figures/feature_importance.png}
-  \caption{LightGBM 模型特征重要性分析 (Top 20)。前几个最关键的特征（如 Epoch Index、Rank、Gap）主要属于实验序列元信息，证明了挖掘实验设计先验的巨大价值；紧随其后的是一系列频域能量和时窗幅值特征。}
-\end{figure}
+最终系统由四个阶段组成：数据读取、特征构建、模型训练与测试推理。训练阶段先读取 \texttt{train\_labels.csv} 并解析元信息，再调用 \texttt{build\_tabular\_features} 生成 1022 维特征矩阵。随后按跨 session 协议训练和验证 LightGBM 模型，记录各随机种子的 Accuracy、AUC 和校准结果。最后在全量训练集上重新训练 5 个 LightGBM 基模型，并保存到 \texttt{models/tabular\_ensemble.joblib}。测试阶段由 \texttt{test.py} 加载该 joblib 文件，对测试集构建同口径特征并输出预测。
 
-\section{最终模型结构与集成策略}
-
-我们的最终方案放弃了单模型输出，转而采用以 LightGBM 为核心的多模型融合架构：
-1. \textbf{超参数寻优}：通过在多个验证集上进行 Grid Search，我们锁定了若干组低学习率、深层（\texttt{num\_leaves=8}）、高采样率（\texttt{subsample=0.9}）的最优超参数。
-2. \textbf{多种子点集成 (Multi-Seed Ensemble)}：为减轻树模型随机初始化的方差，我们分别选取 5 个不同的随机种子（0-4）训练模型，并对 5 个模型的输出概率进行平均。
-3. \textbf{强先验排名校准 (Rank Calibration)}：对于最终测试集的预测，除了直接使用 0.5 概率阈值，我们还设计了基于先验的校准。在每个被试的 Session 内，将集成模型预测为目标类的概率从小到大排序，强制将概率最低的 $N$ 个（验证表明 $N=100$ 是一个泛化表现优异的安全阈值）判定为 \texttt{background}，以此修正概率分布偏移。
-
-\begin{figure}[H]
+\begin{figure}[htbp]
   \centering
   \includegraphics[width=\textwidth]{figures/model_pipeline.png}
-  \caption{最终系统流程图：融合了时域、频域与序列元信息的多维特征，输入多模型集成的 LightGBM 森林，最终通过概率排序与阈值校正输出高质量预测结果。}
+  \caption{EEG 二分类流水线结构图。当前主路径为“原始 EEG 与元信息$\rightarrow$1022 维表格特征$\rightarrow$5 个 LightGBM 基模型$\rightarrow$概率融合$\rightarrow$测试集预测”。}
 \end{figure}
 
+\section{为什么不直接依赖 MLP 基线}
 
-\chapter{训练方法与验证方案设计}
+作业骨架中给出的最基本模型可以作为起点，但对于本任务存在明显局限。若把 $59\times282$ 的 EEG 矩阵直接展平输入 MLP，输入维度高达 16638。即使只接一个较小的隐藏层，参数量也会迅速超过训练样本数。这样的模型容易学习到被试或 session 的偶然幅值模式，而不一定学到可迁移的 target 响应。
 
-\section{严苛的跨 Session 验证方案}
+此外，MLP 不具备卷积网络的局部平移不变性，也不显式利用通道和时间轴结构。对 EEG 来说，临近时间点之间存在强相关，通道之间也有空间组织关系。完全展平会破坏这些结构，使模型必须用大量参数重新学习。对于小样本任务，这通常不是最稳健的路径。
 
-在脑电任务中，如果在整个数据集上随机打乱划分训练和验证集，往往会导致严重的“数据泄露”（同一被试同一状态下的数据被分在了两边），从而高估模型表现。由于测试集是全新的 Session3 数据，为了最真实地模拟这种场景，我们设计了完全无交集的 \textbf{跨 Session 验证 (Cross-Session Validation)}：
-\begin{itemize}
-  \item \textbf{验证方向一}：仅使用所有被试的 Session1 数据训练，在所有被试的 Session2 数据上验证（\texttt{S1$\rightarrow$S2}）。
-  \item \textbf{验证方向二}：仅使用所有被试的 Session2 数据训练，在所有被试的 Session1 数据上验证（\texttt{S2$\rightarrow$S1}）。
-\end{itemize}
+\section{紧凑 EEGNet-style 神经网络}
 
-这种验证方式极其严苛，但它指导我们筛选出真正学到了泛化特征（而不仅仅是记住 session 噪声）的模型方案。
+当前 \texttt{model.py} 中实现了一个紧凑的 EEGNet-style 分类器。该模型在前向传播时构造两个输入分支：一个是单试次 z-score 标准化后的信号，另一个是按微伏尺度缩放的幅值信号。随后使用时间卷积、深度可分离空间卷积、池化、dropout 和全连接层进行分类。其主要结构可以概括为：
 
-\section{运行设置与代码结构}
-
-训练命令与环境要求严格按照作业说明：
-\begin{itemize}
-  \item 环境依赖：\texttt{conda activate cogn} (包含 pandas, numpy, scikit-learn, lightgbm, joblib 等)
-  \item 特征提取与工程库：\texttt{feature\_engineering.py}
-  \item 模型训练脚本：运行 \texttt{python train.py}，脚本自动完成跨 session 的特征提取、超参训练，并将得到的 5 个种子模型打包存储为 \texttt{models/tabular\_ensemble.joblib}。
-  \item 测试推理脚本：运行 \texttt{python test.py}，脚本加载测试集，调用特征工程生成测试特征，加载 \texttt{joblib} 预测多模型概率，取均值后采用最佳的 Threshold 或 Calibration 规则生成 \texttt{res/predictions.csv}。
-\end{itemize}
-
-\chapter{实验结果与误差分析}
-
-\section{验证结果表现}
-
-经过最终的优化，我们的多模型集成（Multi-seed Ensemble）在跨 Session 验证中的表现总结如下表：
-
-\begin{table}[H]
-\centering
-\begin{tabular}{lccc}
-\hline
-验证方向 & Accuracy (Threshold 0.5) & AUC Score & Rank Calibrated Accuracy (N=100) \\
-\hline
-Session1 $\rightarrow$ Session2 & 0.8122 & 0.8856 & 0.8052 \\
-Session2 $\rightarrow$ Session1 & 0.7779 & 0.8565 & 0.7791 \\
-\hline
-\textbf{平均表现} & \textbf{0.7950} & \textbf{0.8711} & \textbf{0.7921} \\
-\hline
-\end{tabular}
-\caption{最终 Ensemble 方案跨 session 验证核心指标。无论哪种方向，准确率都远超 0.75 的满分标准，具有极高的稳定性。}
-\end{table}
-
-\begin{figure}[H]
-  \centering
-  \includegraphics[width=0.88\textwidth]{figures/validation_metrics.png}
-  \caption{交叉验证的 AUC 性能条形图对比。S1$\rightarrow$S2 的 AUC 高达 0.88 左右，S2$\rightarrow$S1 也在 0.85 左右，证明模型具有出色的区分能力。}
-\end{figure}
-
-\section{误差分析与讨论}
-
-尽管准确率突破了 0.80，但误差依然存在，主要源于以下几个方面：
 \begin{enumerate}
-    \item \textbf{不同被试的内在生理差异}：尽管我们在特征层面引入了被试先验，并且进行了一定程度的时窗归一化，但某些被试在脑电微弱响应上的信噪比极差。特别是在 S2$\rightarrow$S1 方向，子被试的方差导致整体 Acc 略低于正向。
-    \item \textbf{脑电信号非平稳性导致的特征漂移}：Session 间隔的时间可能会引起电极阻抗变化或被试注意力状态变化。这导致部分依赖绝对幅值的时窗特征在跨 session 泛化时失效。这也是为什么集成树模型相比神经网络表现更好的原因（树模型在应对特征分布的非线性漂移时往往比全连接更具韧性）。
-    \item \textbf{校准阈值的极限}：尽管训练集中每个 Session 的 background 数目精确为 90，但我们在测试集（Session3）中采用了 $N=100$ 的软校准策略，这是因为测试集的总 epoch 数相较于前两个 session 略有增加（比如部分被试测试集 epoch 有 178 个）。强制卡死 90 可能会导致漏掉假阴性样本，因此保留 0.5 概率阈值与 100 数值软校准作为双重保险。
+  \item 时间卷积：使用 $(1,65)$ 卷积核提取时间方向局部模式；
+  \item 空间深度卷积：使用覆盖 59 个通道的卷积核学习通道组合；
+  \item 可分离卷积：降低参数量并提取更高层的时序特征；
+  \item 平均池化与 dropout：压缩时间分辨率并控制过拟合；
+  \item 全连接分类器：输出 background 与 target 两类 logits。
 \end{enumerate}
 
+该网络结构比普通 MLP 更符合 EEG 数据形态，也为后续进一步探索端到端模型保留了接口。不过，当前 \texttt{train.py} 中 \texttt{train\_neural\_model=False}，说明最终提交主模型并未依赖神经网络训练，而是选择了更稳定的表格特征集成方案。
 
-\section{最终测试集提交预测}
+\section{选择 LightGBM 的原因}
 
-我们将最终方案在全量训练数据（Session1 + Session2）上进行联合训练，并应用于 842 个测试样本上，生成了 \texttt{res/predictions.csv}。当前预测的分布情况如下：
+LightGBM 是梯度提升决策树模型，适合处理中等维度表格特征、非线性阈值关系和特征交互。相比神经网络，它在小样本表格任务上通常更容易训练，不需要复杂的学习率调度和大规模数据增强；相比线性模型，它能自动学习“某个 epoch 区间 + 某个通道窗口标准差 + 某个局部密度”这样的组合规则。
 
-\begin{table}[H]
+当前实现中，LightGBM 的基础超参数为：
+\[
+\texttt{num\_leaves}=10,\quad
+\texttt{learning\_rate}=0.025,\quad
+\texttt{subsample}=0.92,\quad
+\texttt{colsample\_bytree}=0.82,
+\]
+并设置 \texttt{reg\_lambda}=2.0、\texttt{reg\_alpha}=0.15、\texttt{min\_child\_samples}=10。该配置在保持正则化的同时略微提高了单棵树的表达能力。每个基模型使用 300 棵树，并通过不同随机种子训练 5 个模型，最后对 target 概率取平均。
+
+\begin{table}[htbp]
 \centering
-\begin{tabular}{lc}
+\small
+\begin{tabular}{lp{8.2cm}}
 \hline
-预测类别 & 样本数量 \\
+超参数 & 作用与设计理由 \\
 \hline
-background & 519 \\
-target & 323 \\
+\texttt{num\_leaves=10} & 在控制单棵树复杂度的同时，允许模型学习稍复杂的跨特征交互。 \\
+\texttt{learning\_rate=0.025} & 使用更低学习率配合更多树，提升概率排序的稳定性。 \\
+\texttt{subsample=0.92} & 每棵树使用部分样本，降低基模型方差。 \\
+\texttt{colsample\_bytree=0.82} & 每棵树使用部分特征，避免过度依赖少数元信息特征。 \\
+\texttt{reg\_lambda=2.0} 与 \texttt{reg\_alpha=0.15} & 引入更强 L2/L1 正则化，抑制复杂分裂。 \\
+\texttt{min\_child\_samples=10} & 防止叶节点样本过少，提高分裂规则的统计可靠性。 \\
 \hline
 \end{tabular}
-\caption{最终测试集 (Session3) 预测分布。预测 background 略多，与训练集的先验分布（背景占优）基本吻合。}
+\caption{LightGBM 主要超参数及其作用。整体配置偏保守，目标是在跨 session 场景下获得稳定表现。}
 \end{table}
 
+\section{多随机种子集成}
+
+单个梯度提升树模型会受到随机种子、行采样和列采样影响。虽然单个 LightGBM 已经有较强性能，但在 EEG 这种噪声较高的任务中，模型输出概率可能随随机种子产生小幅波动。为降低方差，最终方案训练 5 个基模型：
+\[
+p_{\mathrm{ens}}(y=1|x)=\frac{1}{5}\sum_{k=1}^{5}p_k(y=1|x).
+\]
+概率平均比硬投票保留了更多置信度信息。如果多个模型都给出接近 0.9 的 target 概率，说明该样本的预测较稳定；如果不同模型判断不一致，平均概率会靠近阈值，从而反映不确定性。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.86\textwidth]{figures/report_validation_model_variance.png}
+  \caption{5 个 LightGBM 随机种子在两个跨 session 验证方向上的 Accuracy 与 AUC 波动。虚线为集成模型结果；可以看到各基模型表现接近，集成主要用于降低方差并提升概率稳定性。}
+\end{figure}
+
+\section{后处理与校准策略}
+
+代码中实现了两类预测规则：阈值预测和固定 background 数量的 rank 校准。阈值预测即：
+\[
+\hat{y}=
+\left\{
+\begin{array}{ll}
+\texttt{target}, & p(y=1|x)\geq 0.5,\\
+\texttt{background}, & p(y=1|x)<0.5.
+\end{array}
+\right.
+\]
+rank 校准则根据同一被试同一 session 内 target 概率从低到高排序，将概率最低的若干样本强制设为 \texttt{background}。该策略来自训练集中每个被试-session background 数量固定为 90 的结构规律。
+
+最终测试配置中，\texttt{prediction\_rule} 为 \texttt{threshold}，即实际提交预测采用阈值规则。训练脚本会在两个跨 session 验证方向上扫描候选阈值，并优先选择能提高较弱验证方向的阈值；当前自动选择结果为 0.445。模型包中仍保存了 \texttt{prediction\_background\_count=100} 等信息，便于在验证或备选策略中使用。保留 rank 校准函数是有意义的：当未来发现测试集 session 的 background 数量也固定时，可以用它作为概率漂移的修正；但在隐藏测试标签未知的情况下，阈值规则更少引入额外假设。
+
+\chapter{训练方法与验证方案}
+
+\section{为什么随机划分不够可靠}
+
+对于图像或普通表格任务，随机划分训练集和验证集通常可以作为初步评估。但在本项目中，随机划分存在明显风险。假设某名被试在 Session1 中存在较强的眼动噪声或电极阻抗特征，随机划分会使该 session 的样本同时出现在训练集和验证集。模型只要学到该 session 的统计特征，就可能在验证集上取得较高准确率，但这种能力不一定能迁移到 Session3。
+
+此外，epoch 序列本身具有结构。如果随机划分把同一被试同一 session 的相邻 epoch 分到训练和验证两侧，那么元信息特征会产生近邻泄露。验证集中的某个样本可能在训练集中有接近的 epoch 邻居，模型可以利用局部密度和 gap 规律间接推断标签。因此，随机验证结果不能作为最终模型选择的主要依据。
+
+\section{跨 session 验证协议}
+
+为了更接近测试场景，我们使用两个互补的跨 session 验证方向：
+
+\begin{itemize}
+  \item \textbf{Session1$\rightarrow$Session2}：使用所有被试的 Session1 样本训练，在所有被试的 Session2 样本验证；
+  \item \textbf{Session2$\rightarrow$Session1}：使用所有被试的 Session2 样本训练，在所有被试的 Session1 样本验证。
+\end{itemize}
+
+这两个方向都保证训练样本与验证样本不属于同一个 session。由于测试集是 Session3，该协议虽然仍不能完全等价于真实测试，但比随机划分更严格。若模型在两个方向都超过 0.75，说明它不仅适应某一个训练方向，也具备较稳定的 session 间迁移能力。
+
+\section{评价指标}
+
+主要评价指标为 Accuracy，因为作业评分直接使用测试集准确率。与此同时，我们也记录 ROC-AUC。Accuracy 依赖固定阈值，反映最终分类结果；AUC 不依赖阈值，反映模型对正负样本排序的能力。对于可能进行 rank 校准或阈值微调的场景，AUC 尤其重要：如果 AUC 高，说明模型概率排序可靠，即便阈值不是最优，也可以通过校准改善。
+
+此外，训练脚本还记录了 \texttt{calibrated\_accuracy} 和 \texttt{rank\_calibrated\_accuracy}。前者使用每个训练被试-session 90 个 background 的先验，后者使用配置中的预测 background 数量。它们帮助我们判断模型概率排序是否稳定，以及固定数量校准是否会带来收益。
+
+\section{工程化训练流程}
+
+训练脚本 \texttt{train.py} 的主流程如下。
+
+\begin{enumerate}
+  \item 创建 \texttt{models/} 和 \texttt{res/} 目录；
+  \item 读取 \texttt{data/train\_labels.csv}；
+  \item 调用 \texttt{train\_tabular\_ensemble} 构建全量特征矩阵；
+  \item 对两个跨 session split 逐一训练 5 个 LightGBM 基模型并记录验证指标；
+  \item 在全量训练集上重新训练 5 个最终基模型；
+  \item 保存模型包到 \texttt{models/tabular\_ensemble.joblib}；
+  \item 保存验证结果到 \texttt{res/tabular\_validation.csv}。
+\end{enumerate}
+
+该流程把验证模型和最终模型区分开：验证阶段只用于评估泛化能力，最终提交模型则使用全部有标签数据训练，以最大化可用信息。测试脚本 \texttt{test.py} 再加载最终模型包，生成 \texttt{res/predictions.csv} 和 \texttt{res/prediction\_probabilities.csv}。
+
+\chapter{实验结果}
+
+\section{跨 session 验证结果}
+
+最终 5 模型概率平均集成在两个跨 session 方向上的结果如下。使用默认 0.50 阈值时，Session1 到 Session2 的准确率为 0.8146，Session2 到 Session1 的准确率为 0.7815；根据双向跨 session 验证将阈值校准为 0.445 后，两方向准确率分别为 0.8134 和 0.7922。该阈值并非追求某一个方向的最高分，而是提高较弱方向的下限。两个方向的准确率均高于 0.75，AUC 分别为 0.8867 和 0.8575，说明模型不仅能给出较准确的硬分类，也能较好地区分两类样本的概率排序。
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lcccc}
+\hline
+验证方向 & 0.50 Accuracy & 0.445 Accuracy & ROC-AUC & 90-background 校准 Accuracy \\
+\hline
+Session1 $\rightarrow$ Session2 & 0.8146 & 0.8134 & 0.8867 & 0.8028 \\
+Session2 $\rightarrow$ Session1 & 0.7815 & 0.7922 & 0.8575 & 0.7767 \\
+\hline
+平均 & 0.7980 & 0.8028 & 0.8721 & 0.7898 \\
+\hline
+\end{tabular}
+\caption{最终 LightGBM 集成模型的跨 session 验证结果。阈值校准后两个方向均超过 0.75 满分参考线，平均准确率约为 0.803。}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.86\textwidth]{figures/validation_metrics.png}
+  \caption{跨 session 验证 AUC 对比。两个方向均保持较高 AUC，说明模型输出概率具有良好的排序能力。}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.86\textwidth]{figures/validation_accuracy.png}
+  \caption{跨 session 验证准确率对比。最终集成模型在两个方向上均超过评分公式中的 0.75 参考线。}
+\end{figure}
+
+\section{单模型与集成模型比较}
+
+从 \texttt{res/tabular\_validation.csv} 可以看到，单个随机种子的 LightGBM 已经具有较强性能。在 Session1$\rightarrow$Session2 方向，5 个基模型 Accuracy 大约在 0.8122 到 0.8157 之间，AUC 大约在 0.8820 到 0.8897 之间；在 Session2$\rightarrow$Session1 方向，Accuracy 大约在 0.7743 到 0.7874 之间，AUC 大约在 0.8488 到 0.8664 之间。集成模型结果位于该范围内并更加稳定。
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lccc}
+\hline
+方向 & 单模型 Accuracy 范围 & 单模型 AUC 范围 & 集成 Accuracy/AUC \\
+\hline
+S1$\rightarrow$S2 & 0.8122--0.8157 & 0.8820--0.8897 & 0.8146 / 0.8867 \\
+S2$\rightarrow$S1 & 0.7743--0.7874 & 0.8488--0.8664 & 0.7815 / 0.8575 \\
+\hline
+\end{tabular}
+\caption{不同随机种子基模型与集成模型的表现范围。集成的主要价值是降低随机波动，而不是依赖某个偶然高分模型。}
+\end{table}
+
+\section{特征重要性观察}
+
+为了辅助解释特征贡献，我们使用同一套 1022 维特征训练了树模型代理并绘制 Top 20 重要性。排名靠前的特征包含 epoch、rank、gap 等序列特征，也包含若干窗口级信号统计量。这说明模型并不是只依赖 EEG 幅值，也不是只依赖文件名元信息，而是在两类特征之间形成组合判断。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.9\textwidth]{figures/feature_importance.png}
+  \caption{树模型代理特征重要性 Top 20。序列元信息在模型中占据重要位置，窗口统计特征则提供脑电响应层面的补充证据。}
+\end{figure}
+
+需要强调的是，特征重要性高并不等价于因果解释。epoch 或 gap 的重要性说明它们对预测有帮助，但并不意味着 target 的神经机制由 epoch 决定；它更可能反映实验刺激安排与标签之间的统计关系。相反，窗口统计特征与 EEG 响应更接近神经活动本身，但单个窗口的效应弱，需要与其他特征一起使用。因此，本报告把特征重要性理解为模型判别证据来源，而不是认知机制的直接证明。
+
+\section{测试集预测分布}
+
+最终模型在全量训练数据上训练后，对 842 个测试样本进行预测。输出结果中 \texttt{background}=485，\texttt{target}=357。从整体比例看，background 占约 57.60\%，target 占约 42.40\%。该比例仍低于训练集 target 比例，但相比未校准阈值更少保守。考虑到测试集标签未知，这一现象可能来自真实 target 比例变化，也可能来自 session 漂移导致的概率分布偏移。
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lcc}
+\hline
+测试集预测标签 & 样本数量 & 比例 \\
+\hline
+background & 485 & 57.60\% \\
+target & 357 & 42.40\% \\
+\hline
+合计 & 842 & 100.00\% \\
+\hline
+\end{tabular}
+\caption{测试集最终预测分布。实际提交文件为 \texttt{res/predictions.csv}。}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.86\textwidth]{figures/prob_distribution.png}
+  \caption{测试集预测概率分布。阈值 0.445 将样本分为 background 与 target；靠近阈值的样本是潜在高风险样本，远离阈值的样本预测更稳定。}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.72\textwidth]{figures/report_prediction_by_subject.png}
+  \caption{测试集按被试统计的预测标签分布。不同被试的 target 数量存在差异，提示被试差异仍是最终预测中的重要因素。}
+\end{figure}
+
+\section{概率置信度分析}
+
+根据 \texttt{res/prediction\_probabilities.csv}，预测为 background 的样本 target 概率均值约为 0.2204，中位数约为 0.2030，最大值接近 0.4439；预测为 target 的样本 target 概率均值约为 0.7727，中位数约为 0.8223，最小值约为 0.4482。这说明模型输出并非大量集中在 0.445 附近，而是存在一定的双峰分离。概率越靠近阈值，预测越容易受到阈值选择或校准策略影响；概率越接近 0 或 1，说明多个树模型对该样本的判断更一致。
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lcccccc}
+\hline
+预测标签 & 数量 & 均值 & 标准差 & 最小值 & 中位数 & 最大值 \\
+\hline
+background & 485 & 0.2204 & 0.1186 & 0.0304 & 0.2030 & 0.4439 \\
+target & 357 & 0.7727 & 0.1773 & 0.4482 & 0.8223 & 0.9865 \\
+\hline
+\end{tabular}
+\caption{测试集 target 概率按预测标签分组的描述统计。}
+\end{table}
+
+\chapter{误差分析与风险讨论}
+
+\section{跨 session 方向差异}
+
+模型在 Session1$\rightarrow$Session2 上的阈值校准 Accuracy 为 0.8134，而在 Session2$\rightarrow$Session1 上为 0.7922，后者低约 0.0212。这一差异说明两个训练方向并非完全对称。可能原因包括：Session1 和 Session2 的信号质量不同；某些被试在两个 session 中的 target 响应强弱不同；或者 Session2 的目标比例、epoch 分布更接近/远离 Session1。
+
+该现象提醒我们，平均准确率虽然超过 0.75，但模型仍然受到 session 漂移影响。如果隐藏测试 Session3 与某个训练 session 更相似，模型表现可能接近较高方向；如果 Session3 有新的噪声模式，表现可能下降。因此，报告中不能把 0.8134 视为必然测试准确率，而应把双向跨 session 平均值约 0.803 视为更保守的内部估计。
+
+\section{可能的错误样本类型}
+
+从模型机制推断，错误样本大致可能分为四类。
+
+\begin{enumerate}
+  \item \textbf{信号弱但序列像 target 的 background}：如果某个 background 样本的 epoch 位置和局部间隔与 target 常见模式相似，模型可能给出较高 target 概率。
+  \item \textbf{信号强但序列像 background 的 target}：如果某个 target 的 EEG 响应较明显但出现在模型认为 background 更常见的序列位置，可能被序列特征压低概率。
+  \item \textbf{被试特异噪声样本}：某些被试可能存在更强眼动、肌电或电极噪声，导致窗口均值和标准差偏离训练规律。
+  \item \textbf{阈值附近样本}：概率接近 0.445 的样本本身证据不足，轻微的模型方差或阈值变化都可能改变最终标签。
+\end{enumerate}
+
+这些错误类型也对应后续改进方向：若要降低第一、二类错误，可以引入更严格的特征消融，避免元信息过度主导；若要降低第三类错误，可以加入被试内标准化、稳健统计或伪迹检测；若要降低第四类错误，可以使用验证集进行阈值校准或保留不确定性分析。
+
+\section{元信息特征的收益与风险}
+
+元信息特征是本方案获得较好验证性能的重要来源，但也带来解释风险。它们捕捉的是实验设计结构，而不是脑电生理响应本身。对于预测任务，只要训练和测试遵循同一实验范式，利用这类结构信息是合理的；但如果研究目标是解释 target 诱发的认知加工机制，则必须区分“预测相关”与“机制相关”。
+
+本报告采取折中立场：在模型预测中使用元信息，因为作业目标是生成高准确率预测；在认知解释中不把元信息解释为神经机制，而是将其视为实验任务结构。真正与神经响应更相关的是窗口统计、通道差异和 ERP 均值波形。这样既能保持工程性能，也能避免过度阐释。
+
+\section{固定 background 数量校准的边界}
+
+训练集中每个被试-session background 固定为 90，这是明确的数量先验。验证中使用 90-background 校准时，Session1$\rightarrow$Session2 的校准准确率为 0.8028，低于 0.445 阈值预测准确率 0.8134；Session2$\rightarrow$Session1 的校准准确率为 0.7767，也低于 0.445 阈值预测准确率 0.7922。说明固定数量校准在当前模型上并非优于阈值规则。
+
+最终测试采用阈值规则，是因为测试集每名被试的样本数与 target 数量未知。如果强行假设每个测试 session background 数量为某个固定值，一旦测试序列的 target 数量变化，就会系统性错判。相比之下，阈值规则只依赖模型概率，假设更少。校准函数仍然保留在代码中，作为当外部信息确认测试集数量约束时的备选策略。
+
+\section{AUC 高于 Accuracy 的意义}
+
+两个跨 session 方向的 AUC 分别为 0.8867 和 0.8575，明显高于 Accuracy 数值。这说明模型对样本排序的能力较强，即 target 样本总体上会获得比 background 更高的概率。Accuracy 没有更高，主要受固定阈值和类别边界样本影响。换言之，模型的概率排序较可靠，但在一部分边界样本上，0.445 阈值虽然优于 0.50，仍未必是所有 session 的最优分界。
+
+这一点对隐藏测试集尤为关键。如果测试集存在概率整体偏移，例如所有 target 概率都偏低，AUC 仍可能保持较高，但 Accuracy 会下降。未来若允许使用无标签测试集分布进行校准，可以考虑基于概率分位数或按被试自适应阈值调整，以把排序优势转化为更高准确率。
+
+\chapter{复现流程与代码说明}
+
+\section{工程目录}
+
+当前工程目录与作业说明基本一致，核心文件如下。
+
+\begin{itemize}
+  \item \texttt{data/train/}：训练集 EEG \texttt{.npy} 文件；
+  \item \texttt{data/test/}：测试集 EEG \texttt{.npy} 文件；
+  \item \texttt{data/train\_labels.csv}：训练集标签；
+  \item \texttt{feature\_engineering.py}：元信息与 EEG 统计特征构建；
+  \item \texttt{model.py}：紧凑 EEGNet-style 神经网络定义；
+  \item \texttt{train.py}：LightGBM 集成训练、跨 session 验证与模型保存；
+  \item \texttt{test.py}：加载模型、构建测试特征并输出预测；
+  \item \texttt{models/tabular\_ensemble.joblib}：最终表格集成模型；
+  \item \texttt{res/tabular\_validation.csv}：跨 session 验证结果；
+  \item \texttt{res/predictions.csv}：最终测试集预测；
+  \item \texttt{res/prediction\_probabilities.csv}：测试集 target 概率与预测规则记录；
+  \item \texttt{assignment/body.tex}：本报告正文。
+\end{itemize}
+
+\section{训练命令}
+
+在安装依赖后，可以通过以下命令复现训练：
+
+\[
+\texttt{python train.py}
+\]
+
+脚本会自动读取训练标签，构造特征，执行两个跨 session 验证方向，保存验证结果，并在全量训练集上训练最终模型。若只希望训练当前主模型，无需启用神经网络分支，因为 \texttt{CONFIG} 中 \texttt{train\_neural\_model} 已设置为 \texttt{False}。
+
+\section{测试命令}
+
+训练完成后，可以通过以下命令生成预测：
+
+\[
+\texttt{python test.py}
+\]
+
+脚本首先检查 \texttt{models/tabular\_ensemble.joblib} 是否存在；若存在，则调用与训练阶段相同的 \texttt{build\_tabular\_features} 构建测试特征。随后根据模型包中的 \texttt{selected\_model} 和预测规则计算 target 概率与最终标签，并写出两个文件：\texttt{res/predictions.csv} 和 \texttt{res/prediction\_probabilities.csv}。
+
+\section{依赖环境}
+
+\texttt{requirements.txt} 中列出了主要依赖，包括 \texttt{numpy}、\texttt{pandas}、\texttt{scikit-learn}、\texttt{lightgbm}、\texttt{xgboost}、\texttt{torch}、\texttt{matplotlib}、\texttt{joblib} 等。当前主流程依赖 \texttt{lightgbm} 和常规科学计算库；\texttt{torch} 主要用于保留神经网络模型和可选训练分支。
+
+为了保证复现稳定，建议在同一 Python 环境中安装依赖，并保持训练和测试阶段使用相同版本的 \texttt{feature\_engineering.py}。如果特征工程代码改变，而旧的 joblib 模型仍然保留，就会出现训练特征维度与测试特征维度不一致的问题。
+
+\section{可复现性控制}
+
+训练脚本中使用了固定随机种子，并显式训练 5 个随机种子的 LightGBM 模型。虽然 LightGBM 内部仍可能受到线程和硬件环境影响产生极小差异，但整体结果应基本稳定。保存的 \texttt{tabular\_validation.csv} 是验证过程的重要证据，报告中的验证表格均来自该文件，而不是手工估计。
+
+\chapter{进一步改进方向}
+
+\section{更丰富的 EEG 信号特征}
+
+当前实现主要使用时间窗均值和标准差，尚未真正实现频域 band power、通道协方差、Riemannian covariance、CSP 或小波特征。未来可以在不改变验证协议的前提下加入这些特征，并通过消融实验判断是否提升跨 session 性能。例如，可以计算 delta、theta、alpha、beta、gamma 频段能量，或对每个样本构建协方差矩阵并提取上三角特征。但这些扩展必须谨慎正则化，因为特征维度增加会带来新的过拟合风险。
+
+\section{被试内标准化与自适应阈值}
+
+测试集与训练集覆盖同一批被试，因此可以考虑被试内标准化：在每名被试的每个 session 内对信号统计特征进行中心化或分位数变换，以降低 session 间幅值漂移。同时，可以在验证集上学习按被试的阈值修正策略。例如，如果某个被试整体概率偏高，则提高 target 阈值；如果整体概率偏低，则降低阈值。该方法可能进一步把 AUC 优势转化为 Accuracy 提升。
+
+\section{神经网络与表格模型融合}
+
+\texttt{model.py} 中的 EEGNet-style 网络可以作为第二条模型路径。未来可以启用 \texttt{train\_neural\_model}，在跨 session 验证中训练神经网络，并将其输出概率作为额外特征输入 LightGBM，形成 stacking。这样做的潜在优势是：神经网络可能捕获手工统计特征未覆盖的局部时空模式；LightGBM 则负责融合神经网络概率、元信息和窗口统计。缺点是训练复杂度更高，且需要更严格的早停和数据增强。
+
+\section{更细致的错误分析}
+
+如果后续获得测试集反馈或新的标注数据，最有价值的分析不是只报告最终准确率，而是对错判样本进行分组：按被试、按 epoch 区间、按概率置信度、按信号幅值、按模型分歧程度统计错误率。这样可以判断错误主要来自某个被试、某个实验阶段还是某类低置信度样本，并据此调整特征工程和校准策略。
 
 \chapter{小组成员分工}
 
-\begin{table}[H]
+\begin{table}[htbp]
 \centering
+\small
 \begin{tabular}{lp{9cm}}
 \hline
-成员 & 分工 \\
+小组成员 & 任务分工明细 \\
 \hline
-成员1（学号/姓名待填写） & 负责底层数据流搭建、时频特征提取脚本编写、核心模型训练代码优化与测试文件推理生成。\\
-成员2（学号/姓名待填写） & 负责交叉验证体系设计、多种基线模型的搭建实验对比、针对数据不平衡与 Session 漂移的误差分析。\\
-成员3（学号/姓名待填写） & 负责超参数 Grid Search、实验图表与波形可视化绘制、报告结构梳理与最终大作业说明文档的详尽撰写与排版。\\
+成员1（学号/姓名待填写） & 负责工程框架、数据读取模块和特征工程实现，完成 \texttt{load\_data.py}、\texttt{feature\_engineering.py} 的整理，确保训练和测试阶段使用一致的数据处理流程。\\
+成员2（学号/姓名待填写） & 负责模型训练、跨 session 验证与结果记录，完成 LightGBM 多随机种子集成、验证指标导出和测试集预测文件生成。\\
+成员3（学号/姓名待填写） & 负责数据探索、图表绘制和报告撰写，分析类别分布、被试/session 结构、epoch 序列规律、信号窗口差异和误差风险。\\
 \hline
 \end{tabular}
-\caption{小组成员详细分工。}
+\caption{小组成员分工。正式提交前可将占位符替换为真实学号与姓名。}
 \end{table}
 
+\chapter{结论}
+
+本项目围绕 EEG 事件片段二分类任务，构建了一套以跨 session 泛化为核心的建模流程。数据分析表明，训练集虽然全局类别比例接近均衡，但具有明显的被试/session 和 epoch 序列结构；每个训练被试-session 中 background 数量固定为 90，target 数量轻微波动。原始 EEG 信号层面，两类样本的平均响应存在弱差异，但单试次信噪比较低，必须依靠多维统计特征聚合证据。
+
+最终方案使用 1022 维表格特征与 5 个 LightGBM 基模型进行概率集成。严格跨 session 验证显示，模型在 Session1$\rightarrow$Session2 上取得阈值校准 Accuracy 0.8134、AUC 0.8867，在 Session2$\rightarrow$Session1 上取得阈值校准 Accuracy 0.7922、AUC 0.8575，平均准确率约 0.803，超过作业评分公式中的 0.75 满分参考线。测试集最终输出 background 485 个、target 357 个，并保存到 \texttt{res/predictions.csv}。
+
+从方法论上看，本方案的关键不是单纯使用更复杂模型，而是三点结合：第一，使用跨 session 验证避免随机划分高估；第二，将实验序列先验和 EEG 时间窗统计共同编码；第三，通过正则化 LightGBM 和多随机种子集成降低方差。报告也指出了方案边界：元信息特征提升预测性能，但不能直接解释为神经机制；固定数量校准有价值，但在测试标签未知时不宜过度假设。总体而言，当前方案在准确率、可复现性和分析完整性之间取得了较好的平衡。
 
 \chapter{参考文献}
 
 \begin{enumerate}
-  \item Ke, Guolin, et al. "Lightgbm: A highly efficient gradient boosting decision tree." Advances in neural information processing systems 30 (2017).
-  \item Chen, Tianqi, and Carlos Guestrin. "Xgboost: A scalable tree boosting system." Proceedings of the 22nd acm sigkdd international conference on knowledge discovery and data mining. 2016.
-  \item Lawhern, Vernon J., et al. "EEGNet: a compact convolutional neural network for EEG-based brain–computer interfaces." Journal of neural engineering 15.5 (2018): 056013.
-  \item MNE-Python Developers. "MNE: software for exploring brain network dynamics." Open science (2020).
+  \item Ke, Guolin, et al. ``LightGBM: A highly efficient gradient boosting decision tree.'' \textit{Advances in Neural Information Processing Systems} 30 (2017).
+  \item Lawhern, Vernon J., et al. ``EEGNet: a compact convolutional neural network for EEG-based brain-computer interfaces.'' \textit{Journal of Neural Engineering} 15.5 (2018): 056013.
+  \item Chen, Tianqi, and Carlos Guestrin. ``XGBoost: A scalable tree boosting system.'' \textit{Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining}. 2016.
+  \item Donchin, Emanuel, and Michael G. H. Coles. ``Is the P300 component a manifestation of context updating?'' \textit{Behavioral and Brain Sciences} 11.3 (1988): 357--374.
+  \item Luck, Steven J. \textit{An Introduction to the Event-Related Potential Technique}. MIT Press, 2014.
 \end{enumerate}

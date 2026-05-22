@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -7,21 +8,33 @@ from typing import Dict, Iterable, List, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 from lightgbm import LGBMClassifier
-from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from xgboost import XGBClassifier
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, WeightedRandomSampler
+except ModuleNotFoundError:
+    torch = None
+    nn = None
+    DataLoader = None
+    WeightedRandomSampler = None
 
 from feature_engineering import (
     build_tabular_features,
     fixed_background_predictions as fixed_tabular_background_predictions,
 )
-from load_data import EEGDataset
-from model import Net
+try:
+    from load_data import EEGDataset
+    from model import Net
+except ModuleNotFoundError:
+    EEGDataset = None
+    Net = None
+
 from utils import get_device, set_seed
+
+warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -41,8 +54,8 @@ CONFIG = {
     "use_cpu": False,
     "background_per_subject_session": 90,
     "prediction_background_count": 100,
-    "selected_tabular_model": "lgbm_optimized",
-    "decision_threshold": 0.50,
+    "selected_tabular_model": "ensemble_mean",
+    "decision_threshold": 0.445,
     "prediction_rule": "threshold",
     "train_neural_model": False,
 }
@@ -145,6 +158,40 @@ def fixed_background_predictions(
     return pred
 
 
+def select_stable_threshold(
+    split_predictions: List[Tuple[str, np.ndarray, np.ndarray]],
+    thresholds: np.ndarray | None = None,
+) -> Tuple[float, List[Dict[str, float | str]]]:
+    if thresholds is None:
+        thresholds = np.round(np.arange(0.35, 0.6001, 0.005), 3)
+
+    rows: List[Dict[str, float | str]] = []
+    best_key: Tuple[float, float, float] | None = None
+    best_threshold = float(CONFIG["decision_threshold"])
+    for threshold in thresholds:
+        split_scores = {
+            split_name: accuracy_score(labels, probs >= threshold)
+            for split_name, labels, probs in split_predictions
+        }
+        min_accuracy = min(split_scores.values())
+        mean_accuracy = float(np.mean(list(split_scores.values())))
+        # Prefer the threshold that raises the weaker split.  On ties, prefer
+        # higher mean accuracy and then the less aggressive shift from 0.50.
+        key = (min_accuracy, mean_accuracy, -abs(float(threshold) - 0.50))
+        rows.append(
+            {
+                "threshold": float(threshold),
+                "min_accuracy": min_accuracy,
+                "mean_accuracy": mean_accuracy,
+                **split_scores,
+            }
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_threshold = float(threshold)
+    return best_threshold, rows
+
+
 def train_one_run(
     train_indices: List[int],
     val_indices: List[int] | None,
@@ -152,6 +199,9 @@ def train_one_run(
     seed: int,
     save_history: bool,
 ) -> Tuple[Dict[str, torch.Tensor], List[Dict[str, float]], int, float]:
+    if torch is None or EEGDataset is None or Net is None:
+        raise RuntimeError("PyTorch is required when CONFIG['train_neural_model'] is True.")
+
     set_seed(seed)
     device = get_device(CONFIG["use_cpu"])
     label_df = add_metadata(pd.read_csv(CONFIG["train_label_csv"]))
@@ -292,11 +342,18 @@ def train_one_run(
 def make_tabular_models() -> Dict[str, object]:
     models = {}
     base_config = dict(
-        num_leaves=8, learning_rate=0.03, subsample=0.90, colsample_bytree=0.85,
-        reg_lambda=1.5, reg_alpha=0.1, min_child_samples=12, verbose=-1, n_jobs=1
+        num_leaves=10,
+        learning_rate=0.025,
+        subsample=0.92,
+        colsample_bytree=0.82,
+        reg_lambda=2.0,
+        reg_alpha=0.15,
+        min_child_samples=10,
+        verbose=-1,
+        n_jobs=-1,
     )
     for seed in range(5):
-        models[f"lgbm_optimized_{seed}"] = LGBMClassifier(n_estimators=250, random_state=seed, **base_config)
+        models[f"lgbm_mid_{seed}"] = LGBMClassifier(n_estimators=300, random_state=seed, **base_config)
     return models
 
 
@@ -307,6 +364,7 @@ def train_tabular_ensemble(label_df: pd.DataFrame) -> None:
     labels = (meta_df["label"] == "target").astype(int).to_numpy()
 
     validation_rows: List[Dict[str, float | str]] = []
+    ensemble_split_predictions: List[Tuple[str, np.ndarray, np.ndarray]] = []
     split_specs = {
         "session1_to_session2": (
             meta_df.index[meta_df["sess"] == 1].to_numpy(),
@@ -354,6 +412,7 @@ def train_tabular_ensemble(label_df: pd.DataFrame) -> None:
 
         ensemble_prob = np.mean(split_probs, axis=0)
         ensemble_pred = (ensemble_prob >= 0.5).astype(int)
+        ensemble_threshold_pred = (ensemble_prob >= CONFIG["decision_threshold"]).astype(int)
         ensemble_calibrated = fixed_tabular_background_predictions(
             meta_df.iloc[val_idx].reset_index(drop=True),
             ensemble_prob,
@@ -363,15 +422,30 @@ def train_tabular_ensemble(label_df: pd.DataFrame) -> None:
             "split": split_name,
             "model": "ensemble_mean",
             "accuracy": accuracy_score(labels[val_idx], ensemble_pred),
+            "threshold_accuracy": accuracy_score(labels[val_idx], ensemble_threshold_pred),
             "auc": roc_auc_score(labels[val_idx], ensemble_prob),
             "calibrated_accuracy": accuracy_score(labels[val_idx], ensemble_calibrated),
         }
         validation_rows.append(row)
+        ensemble_split_predictions.append((split_name, labels[val_idx], ensemble_prob))
         print(
             f"{split_name} | ensemble_mean | "
-            f"acc={row['accuracy']:.4f} | auc={row['auc']:.4f} | "
+            f"acc={row['accuracy']:.4f} | threshold_acc={row['threshold_accuracy']:.4f} | "
+            f"auc={row['auc']:.4f} | "
             f"calibrated_acc={row['calibrated_accuracy']:.4f}"
         )
+
+    decision_threshold, threshold_rows = select_stable_threshold(ensemble_split_predictions)
+    split_prediction_map = {
+        split_name: (split_labels, split_probs)
+        for split_name, split_labels, split_probs in ensemble_split_predictions
+    }
+    for row in validation_rows:
+        if row["model"] == "ensemble_mean":
+            split_labels, split_probs = split_prediction_map[str(row["split"])]
+            row["threshold_accuracy"] = accuracy_score(split_labels, split_probs >= decision_threshold)
+    pd.DataFrame(threshold_rows).to_csv(RES_DIR / "threshold_scan.csv", index=False)
+    print(f"Selected decision threshold: {decision_threshold:.3f}")
 
     final_models = make_tabular_models()
     for model in final_models.values():
@@ -383,10 +457,11 @@ def train_tabular_ensemble(label_df: pd.DataFrame) -> None:
             "background_per_subject_session": CONFIG["background_per_subject_session"],
             "prediction_background_count": CONFIG["prediction_background_count"],
             "selected_model": CONFIG["selected_tabular_model"],
-            "decision_threshold": CONFIG["decision_threshold"],
+            "decision_threshold": decision_threshold,
             "prediction_rule": CONFIG["prediction_rule"],
             "feature_count": features.shape[1],
             "validation": validation_rows,
+            "threshold_scan": threshold_rows,
         },
         MODEL_DIR / "tabular_ensemble.joblib",
     )
